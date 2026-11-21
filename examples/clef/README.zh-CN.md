@@ -1,6 +1,8 @@
 # 部署 CLEF 自动前缀缓存版 SGLang
 
-这个分支适合在单张 NVIDIA GPU 上，用 BF16 Qwen3.5-4B CLEF 联合头同时回答多个分类问题。调用方每次提交一次完整的 `POST /v1/systemone`。API 的 `state` 由固定 policy 和每笔变化的业务 state 拼成，`questions` 单独传入。服务从连续请求的相同 token 开头学习可恢复位置。更换 policy 可继续使用原实例。更换权重、tokenizer 或模板时启动新实例。
+本分支面向单张 NVIDIA GPU 上的 BF16 Qwen3.5-4B CLEF 联合分类模型。每次调用 `POST /v1/systemone` 时，`state` 传入待分析文本，`questions` 传入一个或多个问题，问题 ID 由调用方命名。
+
+如果几次请求的文本以相同的固定指令开头，服务会按模板渲染、分词后的 token 序列从头匹配，在已驻留且可恢复的检查点继续计算。普通文本的共同开头也能复用。调用方无需标注前缀、设置长度或约定分隔符。每次请求都可以更换文本、问题或两者。更换权重、tokenizer 或模板时启动新实例。[工作原理与模型适用范围](DESIGN.zh-CN.md)
 
 ## 1. 在构建机制作镜像
 
@@ -28,7 +30,7 @@ docker tag "$IMAGE" "$REGISTRY_IMAGE:$TAG"
 docker push "$REGISTRY_IMAGE:$TAG"
 ```
 
-推理机将 `IMAGE` 设为团队仓库映像引用，例如 `registry.example.com/team/clef-sglang@sha256:…`；本机试用可沿用第一步的 `IMAGE`。示例默认 GPU 0、HTTP 端口 38471，显存静态分配比例 0.5 与实验一致。远端业务可通过已有内部网关连接宿主回环监听端口。
+推理机将 `IMAGE` 设为团队仓库的镜像引用，例如 `registry.example.com/team/clef-sglang@sha256:…`。本机试用可沿用第一步的 `IMAGE`。示例使用模型别名 `clef`、GPU 0 和端口 38471，显存静态分配比例设为 0.5。远端客户端可通过内部网关连接该端口。
 
 ```bash
 : "${IMAGE:?请设置派生镜像}" "${CLEF_MODEL:?请设置本地 CLEF 模型目录}"
@@ -37,19 +39,25 @@ PORT=${PORT:-38471}
 docker run --rm --name clef-auto --gpus "device=$CLEF_GPU" --shm-size 1g \
   -p "127.0.0.1:$PORT:30000" \
   --mount "type=bind,src=$(realpath "$CLEF_MODEL"),dst=/models/clef,readonly" \
-  "$IMAGE" --model-path /models/clef --served-model-name guard_base \
+  "$IMAGE" --model-path /models/clef --served-model-name clef \
   --host 0.0.0.0 --port 30000 --context-length 8192 --mem-fraction-static 0.5
 ```
 
-## 3. 验收缓存与答案
+## 3. 发出请求并验证缓存
 
-另开终端，在本分支根目录用 Python 3 执行。脚本只使用标准库，每轮生成一份合成长 policy、三份不同的业务 state 和相同的三个问题。一张 GPU 上运行一个服务即可验证跨请求省算。
+服务就绪后，可先用一个问题验证接口。`ordered` 是调用方为这道题取的名字，`noul` 是 CLEF 接口中是非题的类型名。响应里的 `answers.ordered` 对应这道题。增加或更换问题时，在 `questions` 中提供相应条目即可。[请求和响应字段](../../python/sglang/srt/entrypoints/systemone/protocol.py)
 
 ```bash
-python3 examples/clef/check_cache.py --url http://127.0.0.1:38471
+curl --fail-with-body -sS http://127.0.0.1:38471/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"clef","state":"字母序列为 A、B、C。","questions":{"ordered":{"type":"noul","instructions":"字母是否按字母表顺序排列？"}}}'
 ```
 
-逐笔输出给出输入 token 数、实际恢复数、实际计算数以及从发出 HTTP 请求到收到并解析三个答案的耗时。冷策略的第二笔可能只发现分叉，第三笔才跳过长前缀计算。诊断依靠可选请求头 `X-SGLang-Clef-Cache-Report: 1`。正常业务沿用原有的 API 请求和响应。[请求体与三类题目示例](check_cache.py)
+要观察跨请求复用，在本分支根目录运行下列标准库脚本。它生成三笔共享较长开头、后续文本各异的请求，对每笔报告输入 token 数、实际恢复量、新计算量以及客户端收到并解析全部答案的耗时。脚本通过可选请求头 `X-SGLang-Clef-Cache-Report: 1` 读取引擎计数。若第二笔才发现并建立分叉处的检查点，第三笔才会从该点恢复。问题数量和三笔请求的顺序是这个诊断示例的选择。[验收脚本](check_cache.py)
+
+```bash
+python3 examples/clef/check_cache.py --model clef --url http://127.0.0.1:38471
+```
 
 如需对照全算答案，可在**同一张卡分两次启动同一个镜像**，固定权重、模板、别名和其他参数。
 
@@ -58,12 +66,12 @@ python3 examples/clef/check_cache.py --url http://127.0.0.1:38471
 
 ```bash
 # 全算实例运行时执行
-python3 examples/clef/check_cache.py --url http://127.0.0.1:38471 --save-baseline clef-reference.json
+python3 examples/clef/check_cache.py --model clef --url http://127.0.0.1:38471 --save-baseline clef-reference.json
 # 自动缓存实例运行时执行
-python3 examples/clef/check_cache.py --url http://127.0.0.1:38471 --baseline-file clef-reference.json
+python3 examples/clef/check_cache.py --model clef --url http://127.0.0.1:38471 --baseline-file clef-reference.json
 ```
 
-有两台等配置实例时也可以运行 `python3 examples/clef/check_cache.py --url http://127.0.0.1:38471 --baseline-url http://127.0.0.1:38472`。三笔验收用于确认实际恢复、重算量和答案；稳态吞吐与 P95 需要按负载、并发和预热协议另测。[正式矩阵与独立 100 笔对照](RESULTS.zh-CN.md)
+有两台等配置实例时也可以运行 `python3 examples/clef/check_cache.py --model clef --url http://127.0.0.1:38471 --baseline-url http://127.0.0.1:38472`。三笔请求可核对恢复量、重算量与完整答案。测稳态吞吐和 P95 时应使用代表性负载，并记录并发度和预热条件。[正式矩阵与独立 100 笔对照](RESULTS.zh-CN.md)
 
 ## 4. 查看与维护改动
 
@@ -76,4 +84,4 @@ CUDA_VISIBLE_DEVICES='' HF_HUB_OFFLINE=1 PYTHONPATH="$PWD/python" \
   python -B -m unittest discover -s test/registered/unit/clef -v
 ```
 
-升级时记录上游提交、镜像基座摘要和已验收的成品镜像摘要；先在目标驱动、GPU 和模型上完成全算/自动配对，再替换服务镜像。回滚用前一份已验收的镜像摘要和对应模型版本。[设计和代码阅读路线](DESIGN.zh-CN.md) · [CPU 回归](../../test/registered/unit/clef)
+升级时记录上游提交、镜像基座摘要和成品镜像摘要。在目标驱动、GPU 和模型上完成全量计算与自动缓存的配对验收后，再替换服务镜像。回滚用前一份已验收的镜像摘要和对应模型版本。[设计和代码阅读路线](DESIGN.zh-CN.md) · [CPU 回归](../../test/registered/unit/clef)

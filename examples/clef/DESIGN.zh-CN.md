@@ -1,43 +1,48 @@
-# CLEF 自动前缀缓存的工作原理
+# CLEF 如何跨请求复用前缀
 
-业务每次向 `POST /v1/systemone` 提交完整的 `state` 和本次的 `questions`。本文将 API 的 `state` 称为 **API state**，它由固定策略文本（policy 或 SP）与每笔不同的**业务 state** 拼成。常见输入是 1500-token policy、500-token 业务 state 和三道题。引擎从分词和模板渲染后的实际请求中发现共同的开头。部署端只需装载模型，新 policy 可以直接随请求发送。[快速使用](README.zh-CN.md)
+当两个请求送入同一个 CLEF 服务实例时，引擎可从相同的开头继续计算。调用方照常向 `POST /v1/systemone` 提交完整的 `state` 和本次的 `questions`。引擎按渲染和分词后的 token ID 匹配前缀，调用方无需标记固定文本、声明长度或在部署时登记指令。[请求协议](../../python/sglang/srt/entrypoints/systemone/protocol.py) · [快速使用](README.zh-CN.md)
 
-## 为什么还需要缓存最终隐状态
+## 哪些输入可以复用
 
-在所选上游版本，CLEF 联合分类头走 embedding 模式，配置解析明确关闭 Radix Cache。因果 backbone 让相同 token 前缀产生相同表示，但这个 Qwen3.5-4B 同时有全注意力与线性注意力层。恢复前缀后，后续 token 计算需要该位置的注意力 KV、卷积状态以及 Gated DeltaNet 递推状态。随后，分类头要从完整序列中按本次题目的布局取数。普通的前缀 KV 命中只解决了其中一部分。[上游模型配置](https://github.com/sgl-project/sglang/blob/75a0d91c1f36a03e5213123fcdc4dbf0028ab7b7/python/sglang/srt/arg_groups/model_hook.py) · [本分支分类头](../../python/sglang/srt/layers/joint_schema_head.py)
+联合头端点按模型约定把纯文本输入编码为「模板开头 + `state` 的 token + 本次问题及选项的 token + 模板结尾」。`questions` 可以包含一个或多个支持的问题，类型、ID、顺序和选项由本次请求给出。编码器为问题和模板预留空间，然后按剩余输入预算截取 `state`。最终送入模型的 token 序列决定能共享到哪里。[编码与输入预算](../../python/sglang/srt/entrypoints/systemone/joint_schema.py)
 
-本分支在可恢复边界保存 FP32 递推检查点，把最终隐状态和 token ID 存在与设备 KV 槽对应的位置。worker 读取缓存前缀时核对 token ID，把已经恢复的前缀行和本笔新计算的后缀行按原序拼回。分类头仍使用本请求的题目、位置和完整表示重新评分。相同 policy 配不同业务 state、相同 API state 配不同题目，均按真实分词的公共开头处理。[FP32 检查点](../../python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py) · [按槽恢复](../../python/sglang/srt/layers/clef_hidden_slots.py)
+例如，两次请求的 `state` 都以同一段固定指令开始，后面各附一段不同的文本。两次分词结果从开头相同的部分都有机会复用，第一次出现不同 token 的位置即为匹配上限。如果两次 `state` 相同而问题发生变化，引擎也用同一条规则比较完整的输入。固定指令后实际相同的 token 可以一并匹配，中间发生分歧后再次出现的相同段落则需重新计算。[前缀树键与匹配](../../python/sglang/srt/mem_cache/common.py)
 
-## 一份新 policy 何时受益
+## 匹配了多长，本次就能跳过多长吗？
 
-| 从空缓存串行发送 | 引擎所做的事 |
+实际可跳过的长度取决于共同前缀内仍然有效的检查点。该模型的因果骨干同时包含全注意力和线性注意力层。要从共同前缀中某个位置继续计算，设备上必须同时具备相应的注意力 KV、卷积状态和 Gated DeltaNet 递推状态。调度器根据内核分块和检查点对齐要求选择可保存的位置，Triton 内核直接写出 FP32 递推快照。[检查点位置选择](../../python/sglang/srt/managers/schedule_batch.py) · [FP32 快照](../../python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py)
+
+从空缓存串行发送带有共同开头、不同结尾的请求时，通常可以观察到以下过程。
+
+| 请求 | 引擎行为 |
 |---|---|
-| 第 1 笔，policy P + 业务 state A | 计算完整输入，按引擎对齐规则留下 token 路径和可恢复的检查点。 |
-| 第 2 笔，同一 P + 业务 state B | 找到两笔共同开头。若共同部分内已有检查点，可以直接恢复。若只有更靠后的检查点，则在本笔计算并完成发布后，留下对齐到公共部分的分叉检查点。 |
-| 第 3 笔，同一 P + 业务 state C | 若该分叉检查点仍驻留，恢复前缀，只计算后缀，再对全部题目评分。 |
+| 首次出现这段开头 | 计算完整输入，保存 token 路径和满足对齐条件的模型状态。 |
+| 出现分叉 | 找到共同开头。若其中已有可恢复的检查点，本次就能复用。若需要新建分叉检查点，本次可能仍然全算，完成后发布该检查点。 |
+| 再次经过同一分叉 | 若检查点已发布且仍驻留，引擎从该位置续算。并发请求的完成顺序、条目淘汰都会影响首次恢复的时机。 |
 
-队列查询与实际准入可能看到不同的树。诊断中的 `matched_tokens` 取实际准入时的 KV 匹配长度，`cached_tokens` 表示本次最终结果使用的恢复量，`published_tokens` 表示本次完成后新发布的检查点位置，`computed_tokens` 包含失效重试产生的计算。客户端加可选请求头 `X-SGLang-Clef-Cache-Report: 1` 后可以读取这些字段。普通请求照常只消费公开答案。并发首访、前序请求取消或条目淘汰都会影响首次有效命中的时机。[诊断字段来源](../../python/sglang/srt/managers/scheduler_components/output_streamer.py) · [三笔串行的实际计数](RESULTS.zh-CN.md)
+在仓库的一个 CPU 回归用例中，三个请求的前 213 个 token 相同，后缀各异。在该用例的 64-token 对齐配置下，第二笔匹配了 213 个 token，发布了位置 192 的检查点，第三笔实际跳过了前 192 个 token。[可运行的分叉与恢复用例](../../test/registered/unit/clef/test_radix_branch.py)
 
-## 代码阅读顺序
+可以加请求头 `X-SGLang-Clef-Cache-Report: 1` 查看 `metadata.clef_prefix_cache`。`matched_tokens` 是本次请求进入调度时匹配到的 KV 长度，`cached_tokens` 是最终结果实际恢复的前缀长度，`published_tokens` 是本次新发布的检查点位置。用 `computed_tokens` 核对这次请求实际执行的 token 计算量，其中包含回退重试。刚发布的检查点可供后续请求使用。[调度计数](../../python/sglang/srt/managers/scheduler_components/output_streamer.py) · [HTTP 诊断](../../python/sglang/srt/entrypoints/systemone/serving.py) · [实测轨迹](RESULTS.zh-CN.md)
 
-引擎迁移覆盖基础提交 `75a0d91c1f36a03e5213123fcdc4dbf0028ab7b7` 之上的 21 个 Python 文件。以下命令从仓库根查看引擎差异，便于分别审查行为改动和打包文档。
+## 命中后怎样给本次问题评分
+
+CLEF 联合分类头需要看到完整序列的最终隐藏状态。每个驻留的物理 KV 槽额外保留一个 BF16 隐藏向量和一个 token ID。命中时，worker 按当前请求的槽位映射取出前缀，核对 token ID，再与本次新计算的后缀逐行拼接。分类头按当前请求中的问题位置和选项重新评分。因此，共享开头的请求可以有不同的问题和答案。保存这些向量会减少同样显存预算下可容纳的 token 数。[槽位恢复](../../python/sglang/srt/layers/clef_hidden_slots.py) · [联合分类头](../../python/sglang/srt/layers/joint_schema_head.py) · [显存估算](../../python/sglang/srt/model_executor/pool_configurator.py)
+
+若命中了前缀却未得到有效评分，例如物理槽中记录的 token ID 与当前请求不符，端点丢弃该次结果，将同一输入与现有缓存隔离，重新完整计算一次。已取消的请求保留取消状态。维持正确性的其他条件包括缓存树原有的命名空间和 salt、检查点的发布时机，以及请求执行期间对相应槽位的持有。[缓存匹配](../../python/sglang/srt/mem_cache/common.py) · [检查点发布](../../python/sglang/srt/mem_cache/unified_radix_cache.py) · [回退与取消](../../python/sglang/srt/entrypoints/systemone/serving.py)
+
+## 支持的执行配置
+
+本分支自动启用的范围是单张 NVIDIA GPU、固定权重、未量化 BF16、FP32 递推状态的因果 Qwen3.5-4B CLEF 联合头。能力检测会核对模型结构，包括隐藏维度 2560、32 层以及混合注意力类型。运行时采用确定性 Triton、设备本地 Python Radix 树、`extra_buffer` 检查点和单 token KV 页。这些数值和后端选项描述执行配置，输入前缀的长度由每对请求决定。[能力判定](../../python/sglang/srt/clef_policy_cache.py) · [模型配置](../../python/sglang/srt/arg_groups/model_hook.py)
+
+显式设置 `--disable-radix-cache` 可选择全量计算。LoRA、多卡、不兼容的注意力后端和外部缓存等设置均在这条优化路径的适用范围之外。单笔请求带有多模态输入、自定义输入嵌入或位置覆盖时，会跳过前缀读写。更换权重、tokenizer、模板或校准版本时应启动新实例。[请求级检查](../../python/sglang/srt/mem_cache/common.py) · [权重更新](../../python/sglang/srt/managers/scheduler_components/weight_updater.py)
+
+## 查看差异与验证
+
+在仓库根目录运行以下命令，可以查看本分支对已验收上游版本的引擎改动。
 
 ```bash
 git diff --stat 75a0d91c1f36a03e5213123fcdc4dbf0028ab7b7 HEAD -- python/sglang
 git diff 75a0d91c1f36a03e5213123fcdc4dbf0028ab7b7 HEAD -- python/sglang
 ```
 
-| 阅读位置 | 核对点 |
-|---|---|
-| [能力判定](../../python/sglang/srt/clef_policy_cache.py) · [模型配置](../../python/sglang/srt/arg_groups/model_hook.py) | 联合头、模型结构、设备和用户显式参数共同决定是否启用。HTTP、调度和 worker 读取同一份已解析的配置。 |
-| [KV 匹配](../../python/sglang/srt/mem_cache/common.py) · [树后端](../../python/sglang/srt/mem_cache/unified_cache/tree_core_registry.py) · [发布结果](../../python/sglang/srt/mem_cache/unified_radix_cache.py) · [调度](../../python/sglang/srt/managers/schedule_batch.py) | 使用引擎原有的 RadixKey、命名空间和 salt。仅在实际插入检查点并重新匹配后记录发布位置。隔离冷算请求跳过缓存读写。 |
-| [Triton GDN](../../python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py) · [分块计算](../../python/sglang/kernels/ops/attention/fla/chunk.py) | 直接从计算中写出 FP32 快照。先舍入到 BF16 会影响恢复后各题的概率和分数。 |
-| [容量配置](../../python/sglang/srt/model_executor/pool_configurator.py) · [worker 批信息](../../python/sglang/srt/model_executor/forward_batch_info.py) · [隐状态槽](../../python/sglang/srt/layers/clef_hidden_slots.py) · [联合头](../../python/sglang/srt/layers/joint_schema_head.py) | 为驻留槽预留最终隐状态与 token ID；写回新行、验证命中行，按当前请求还原完整序列。该额外显存会减少给定显存比例下的 token 池容量。 |
-| [System One 端点](../../python/sglang/srt/entrypoints/systemone/serving.py) · [tokenizer manager](../../python/sglang/srt/managers/tokenizer_manager.py) · [输出传递](../../python/sglang/srt/managers/scheduler_components/output_streamer.py) | 若命中后得到空评分，则丢弃该结果，对同一输入仅尝试一次隔离的全量计算。计数同时包含两次尝试。已取消请求保留取消状态。 |
-| [模型加载](../../python/sglang/srt/models/qwen3_5.py) · [激活内核](../../python/sglang/kernels/ops/activation/activation.py) · [换权重保护](../../python/sglang/srt/managers/scheduler_components/weight_updater.py) | 保留联合头 FP32 标量及每题型校准与置信度语义；另带可选 dense SiLU 预编译后端适配。活动缓存实例拒绝受保护的在线换权重路径。 |
-
-## 适用范围与升级
-
-已验证的组合为单 NVIDIA GPU、未量化 BF16、固定权重、纯文本、因果 Qwen3.5-4B 联合头、FP32 递推状态。自动路径使用确定性 Triton、设备本地 Python Radix 树、`extra_buffer` 检查点和单 token KV 页。显式关闭 Radix Cache、切换不兼容后端、LoRA、多卡、分离式或外部缓存等配置会触发相应的能力判定，原模型的其余部署限制仍然适用。多模态或自定义输入嵌入等请求在本实例内绕过前缀读写。模型权重、tokenizer、模板或校准有变化时启动新的实例。[配置判定代码](../../python/sglang/srt/clef_policy_cache.py) · [逐请求判定](../../python/sglang/srt/mem_cache/common.py)
-
-移植到其他 SGLang 提交时，先审查上述接口、生命周期及引擎默认值，再用同模型的确定性全量计算端对照。至少覆盖换 policy、换业务 state、换题、淘汰及失效重试。逐题核对完整公开答案（包括置信度、选项概率和连续分数），再比较净计算量和端到端 P95。可用同一分支追加 `--disable-radix-cache --enable-deterministic-inference --attention-backend triton` 启动对照端。[构建与验收](README.zh-CN.md) · [已验收范围](RESULTS.zh-CN.md)
+可以在同一分支用 `--disable-radix-cache --enable-deterministic-inference --attention-backend triton` 启动全量计算对照端。使用相同模型、tokenizer 和输入，先比较每个问题的完整公开答案与计数，再独立比较经过预热的端到端时延和吞吐。若要将支持范围扩大到其他模型或执行配置，还需覆盖改变问题和前缀、检查点淘汰及失效重试。[部署与配对验收](README.zh-CN.md) · [一致性及性能实验](RESULTS.zh-CN.md)

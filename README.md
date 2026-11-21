@@ -24,7 +24,7 @@ SGLang is an open-source inference framework for large language, vision-language
 
 ## CLEF 自动前缀缓存（本分支）
 
-本分支为单卡 BF16 Qwen3.5-4B CLEF 联合分类模型自动复用跨请求的相同前缀。仓库内可直接构建派生镜像，并用三笔请求核对实际省算和完整答案。[中文快速部署](examples/clef/README.zh-CN.md) · [引擎改动](examples/clef/DESIGN.zh-CN.md) · [性能结果](examples/clef/RESULTS.zh-CN.md)
+在支持的单卡 BF16 Qwen3.5-4B CLEF 模型上，引擎可跨请求复用相同的输入 token 前缀。照常提交文本和问题即可。前缀长度由引擎从实际请求中发现。[中文快速部署](examples/clef/README.zh-CN.md) · [引擎改动](examples/clef/DESIGN.zh-CN.md) · [性能结果](examples/clef/RESULTS.zh-CN.md)
 
 ## Get Started
 

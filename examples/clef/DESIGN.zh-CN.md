@@ -22,7 +22,7 @@
 
 在仓库的一个 CPU 回归用例中，三个请求的前 213 个 token 相同，后缀各异。在该用例的 64-token 对齐配置下，第二笔匹配了 213 个 token，发布了位置 192 的检查点，第三笔实际跳过了前 192 个 token。[可运行的分叉与恢复用例](../../test/registered/unit/clef/test_radix_branch.py)
 
-可以加请求头 `X-SGLang-Clef-Cache-Report: 1` 查看 `metadata.clef_prefix_cache`。`matched_tokens` 是本次请求进入调度时匹配到的 KV 长度，`cached_tokens` 是最终结果实际恢复的前缀长度，`published_tokens` 是本次新发布的检查点位置。用 `computed_tokens` 核对这次请求实际执行的 token 计算量，其中包含回退重试。刚发布的检查点可供后续请求使用。[调度计数](../../python/sglang/srt/managers/scheduler_components/output_streamer.py) · [HTTP 诊断](../../python/sglang/srt/entrypoints/systemone/serving.py) · [实测轨迹](RESULTS.zh-CN.md)
+可以加请求头 `X-SGLang-Clef-Cache-Report: 1` 查看 `metadata.clef_prefix_cache`。`matched_tokens` 是本次请求进入调度时匹配到的 KV 长度，`cached_tokens` 是最终结果实际恢复的前缀长度，`published_tokens` 是本次新发布的检查点位置。用 `computed_tokens` 核对这次请求实际执行的 token 计算量，其中包含回退重试。刚发布的检查点可供后续请求使用。[调度计数](../../python/sglang/srt/managers/scheduler_components/output_streamer.py) · [HTTP 诊断](../../python/sglang/srt/entrypoints/systemone/serving.py)
 
 ## 命中后怎样给本次问题评分
 
@@ -45,4 +45,4 @@ git diff --stat 75a0d91c1f36a03e5213123fcdc4dbf0028ab7b7 HEAD -- python/sglang
 git diff 75a0d91c1f36a03e5213123fcdc4dbf0028ab7b7 HEAD -- python/sglang
 ```
 
-可以在同一分支用 `--disable-radix-cache --enable-deterministic-inference --attention-backend triton` 启动全量计算对照端。使用相同模型、tokenizer 和输入，先比较每个问题的完整公开答案与计数，再独立比较经过预热的端到端时延和吞吐。若要将支持范围扩大到其他模型或执行配置，还需覆盖改变问题和前缀、检查点淘汰及失效重试。[部署与配对验收](README.zh-CN.md) · [一致性及性能实验](RESULTS.zh-CN.md)
+可以在同一分支用 `--disable-radix-cache --enable-deterministic-inference --attention-backend triton` 启动全量计算对照端。使用相同模型、tokenizer 和输入，先比较每个问题的完整公开答案与计数，再独立比较经过预热的端到端时延和吞吐。若要将支持范围扩大到其他模型或执行配置，还需覆盖改变问题和前缀、检查点淘汰及失效重试。[部署与配对验收](README.zh-CN.md)

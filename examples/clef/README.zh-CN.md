@@ -53,25 +53,30 @@ curl --fail-with-body -sS http://127.0.0.1:38471/v1/systemone \
   -d '{"model":"clef","state":"字母序列为 A、B、C。","questions":{"ordered":{"type":"noul","instructions":"字母是否按字母表顺序排列？"}}}'
 ```
 
-要观察跨请求复用，在本分支根目录运行下列标准库脚本。它生成三笔共享较长开头、后续文本各异的请求，对每笔报告输入 token 数、实际恢复量、新计算量以及客户端收到并解析全部答案的耗时。脚本通过可选请求头 `X-SGLang-Clef-Cache-Report: 1` 读取引擎计数。若第二笔才发现并建立分叉处的检查点，第三笔才会从该点恢复。问题数量和三笔请求的顺序是这个诊断示例的选择。[验收脚本](check_cache.py)
+要观察跨请求复用，可以给普通请求加上诊断头 `X-SGLang-Clef-Cache-Report: 1`。下面用 Python 标准库发送三个共享开头、结尾各异的请求。每次运行都生成新的文档编号，方便在已经启动的实例上观察新前缀的发现过程。
 
 ```bash
-python3 examples/clef/check_cache.py --model clef --url http://127.0.0.1:38471
+python3 - <<'PY'
+import json
+from urllib.request import Request, urlopen
+from uuid import uuid4
+
+url = "http://127.0.0.1:38471/v1/systemone"
+prefix = f"Document {uuid4().hex}\n" + "Read the letters in their original order.\n" * 80
+questions = {"ordered": {"type": "noul", "instructions": "Are the letters in alphabetical order?"}}
+for suffix in ("A B C", "C B A", "B A C"):
+    payload = {"model": "clef", "state": prefix + suffix, "questions": questions}
+    headers = {"Content-Type": "application/json", "X-SGLang-Clef-Cache-Report": "1"}
+    request = Request(url, data=json.dumps(payload).encode(), headers=headers)
+    with urlopen(request, timeout=120) as response:
+        result = json.load(response)
+    print(suffix, (result.get("metadata") or {}).get("clef_prefix_cache"))
+PY
 ```
 
-如需对照全算答案，可在**同一张卡分两次启动同一个镜像**，固定权重、模板、别名和其他参数。
+`matched_tokens` 是匹配到的长度，`cached_tokens` 是本次实际恢复的长度，`computed_tokens` 是本次实际计算量。若第二个请求才建立分叉检查点，后续请求可从该点恢复。输出为 `None` 时，可查看启动日志中记录的模型和运行配置是否启用了自动缓存。[缓存诊断与适用范围](DESIGN.zh-CN.md)
 
-1. 第一次在上面的 `docker run` 末尾追加 `--disable-radix-cache --enable-deterministic-inference --attention-backend triton`。服务就绪后保存本轮合成请求的确定性基准。
-2. 停止该测试实例，用第二步原命令启动自动缓存服务，回放同一批请求。脚本会比较所有题目的完整 `answers`，包括置信度、选项概率与连续分数。退出码 0 表示本轮通过。
-
-```bash
-# 全算实例运行时执行
-python3 examples/clef/check_cache.py --model clef --url http://127.0.0.1:38471 --save-baseline clef-reference.json
-# 自动缓存实例运行时执行
-python3 examples/clef/check_cache.py --model clef --url http://127.0.0.1:38471 --baseline-file clef-reference.json
-```
-
-有两台等配置实例时也可以运行 `python3 examples/clef/check_cache.py --model clef --url http://127.0.0.1:38471 --baseline-url http://127.0.0.1:38472`。三笔请求可核对恢复量、重算量与完整答案。测稳态吞吐和 P95 时应使用代表性负载，并记录并发度和预热条件。[正式矩阵与独立 100 笔对照](RESULTS.zh-CN.md)
+要核对自己的输入在启用缓存前后的输出，可以分两次启动同一个镜像。全量计算实例在启动命令末尾追加 `--disable-radix-cache --enable-deterministic-inference --attention-backend triton`。另一次使用上面的自动缓存启动命令。向两端回放相同的请求，按问题 ID 比较完整的 `answers` 字段。
 
 ## 4. 查看与维护改动
 

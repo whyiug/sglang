@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 import msgspec
 import torch
 
+from sglang.srt import clef_policy_cache
 from sglang.srt.constants import (
     GPU_MEMORY_ALL_TYPES,
     GPU_MEMORY_TYPE_CUDA_GRAPH,
@@ -137,6 +138,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        if clef_policy_cache.enabled():
+            return UpdateWeightFromDiskReqOutput(success=False, message=clef_policy_cache.FIXED_WEIGHTS, num_paused_requests=0)
         with self._observe_weight_load("disk"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -264,6 +267,8 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        if clef_policy_cache.enabled():
+            return UpdateWeightsFromIPCReqOutput(success=False, message=clef_policy_cache.FIXED_WEIGHTS)
         with self._observe_weight_load("ipc"):
             success, message = True, "Succeeded to update model weights."
             target_updated = False
@@ -308,6 +313,8 @@ class SchedulerWeightUpdaterManager:
 
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Open the session: restore in-place-packed weights on the selected runners."""
+        if clef_policy_cache.enabled():
+            return BeginWeightUpdateReqOutput(success=False, message=clef_policy_cache.FIXED_WEIGHTS)
         if self._session is not None:
             return BeginWeightUpdateReqOutput(
                 success=False,

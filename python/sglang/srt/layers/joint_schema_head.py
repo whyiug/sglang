@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.layers.clef_hidden_slots import ClefHiddenSlots
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 
 # Question types in the order of the head's type embedding.
@@ -487,8 +488,8 @@ class JointSchemaPooler(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch
     ) -> EmbeddingPoolerOutput:
         if (
-            forward_batch.decision_layouts is None
-            or forward_batch.extend_seq_lens_cpu is None
+            forward_batch.extend_seq_lens_cpu is None
+            or (forward_batch.decision_layouts is None and getattr(forward_batch, "clef_req_to_token", None) is None)
         ):
             return EmbeddingPoolerOutput(
                 embeddings=[
@@ -498,14 +499,19 @@ class JointSchemaPooler(nn.Module):
             )
         lengths = list(forward_batch.extend_seq_lens_cpu)
         prefix_lengths = forward_batch.extend_prefix_lens_cpu or [0] * len(lengths)
-        raw_layouts = forward_batch.decision_layouts
+        input_ids = forward_batch.input_ids
+        raw_layouts = forward_batch.decision_layouts or [None] * len(lengths)
+        if getattr(forward_batch, "clef_req_to_token", None) is not None:
+            if not hasattr(self, "_clef_slots"):
+                self._clef_slots = ClefHiddenSlots(forward_batch.clef_slot_count, hidden_states)
+            hidden_states, input_ids, lengths, raw_layouts = self._clef_slots.restore(
+                hidden_states, forward_batch, lengths, prefix_lengths, raw_layouts
+            )
+            prefix_lengths = [0] * len(lengths)
         embeddings: List[torch.Tensor] = [
             hidden_states.new_empty(0, dtype=torch.float32) for _ in lengths
         ]
-        # The tokenizer manager checks every layout against its prompt, and the
-        # server runs each prompt in one uncached prefill. A layout that no longer
-        # fits its prompt, as after a truncation, gets no scores, which the
-        # decision route reports as a server error.
+        # The head only sees complete sequences with verified token identities.
         layouts = {}
         for i, (layout, prefix, length) in enumerate(
             zip(raw_layouts, prefix_lengths, lengths)
@@ -529,7 +535,7 @@ class JointSchemaPooler(nn.Module):
             start, end = offsets[run[0]], offsets[run[-1] + 1]
             logits = self.head.forward_batch(
                 hidden_states[start:end],
-                forward_batch.input_ids[start:end],
+                input_ids[start:end],
                 [lengths[i] for i in run],
                 [layouts[i] for i in run],
                 self._output_embedding(),

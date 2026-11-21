@@ -1802,6 +1802,8 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     #   Stacked:     [stacked_tensor(N, ...)] — len 1, reduces pickle overhead
     #   Non-stacked: [t0, t1, ..., tN]       — len N, when shapes differ or None entries exist
     pooled_hidden_states: Optional[List[Optional[torch.Tensor]]] = None
+    # Device Radix match, branch candidate and committed checkpoint in input tokens.
+    clef_cache_traces: Optional[List[Dict[str, int]]] = None
 
 
 class ClearHiCacheReqInput(BaseReq, kw_only=True):

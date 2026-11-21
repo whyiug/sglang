@@ -2479,7 +2479,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.output_token_sampling_mask
                     )
 
-            if not isinstance(recv_obj, BatchEmbeddingOutput):
+            if isinstance(recv_obj, BatchEmbeddingOutput):
+                if recv_obj.clef_cache_traces is not None:
+                    meta_info["cached_tokens"] = recv_obj.cached_tokens[i]
+                    meta_info["clef_cache_trace"] = recv_obj.clef_cache_traces[i]
+            else:
                 meta_info.update(
                     {
                         "reasoning_tokens": recv_obj.reasoning_tokens[i],

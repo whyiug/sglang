@@ -2506,6 +2506,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             )
         )
         self.pooler.head.load_state_dict(state_dict, strict=True)
+        # Preserve the fp32 scalar scales of Unsloth calibrated checkpoints.
+        for name, parameter in self.pooler.head.named_parameters():
+            if parameter.ndim == 0:
+                parameter.data = state_dict[name].to(parameter.device, torch.float32)
 
     def _load_decision_readout(self) -> None:
         """Place the checkpoint's decision readout in the LM head rows of its codes."""

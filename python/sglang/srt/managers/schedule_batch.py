@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sglang.srt import clef_policy_cache
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
@@ -3051,6 +3052,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlen_aligned = (
                 prefix_len + (req.extend_len // checkpoint_grid) * checkpoint_grid
             )
+        if clef_policy_cache.enabled() and req.skip_radix_cache_insert:
+            mask = False
         track_index = req.kv.mamba_ping_pong_track_buffer[
             req.kv.mamba_next_track_idx
         ].item()

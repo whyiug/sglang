@@ -39,6 +39,7 @@ import torch
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt import clef_policy_cache
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.req_to_expected_token_ids_manager import (
     compute_req_all_ids_info,
@@ -617,6 +618,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Joint schema head decision layouts (one per request, None if absent)
     decision_layouts: Optional[List[Optional[List[int]]]] = None
+    clef_req_to_token: Optional[torch.Tensor] = None
+    clef_slot_count: int = 0
+    clef_expected_prefixes: Optional[List] = None
 
     # === Borrowed from ScheduleBatch: compound (carry their own device tensors) ===
     # Sampling info
@@ -1066,6 +1070,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
         ret._maybe_init_non_generation_fields(batch)
+        if (clef_policy_cache.enabled() and batch.model_config.joint_head_config is not None
+                and extend_prefix_lens is not None):
+            pool = model_runner.token_to_kv_pool
+            ret.clef_req_to_token = model_runner.req_to_token_pool.req_to_token
+            ret.clef_slot_count = pool.size + pool.page_size
+            ret.clef_expected_prefixes = [
+                req.origin_input_ids[:prefix] for req, prefix in zip(batch.reqs, extend_prefix_lens)
+            ]
 
         device = model_runner.device
 

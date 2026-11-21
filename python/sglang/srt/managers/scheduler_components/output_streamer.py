@@ -14,6 +14,7 @@ from typing import (
 import torch
 import zmq
 
+from sglang.srt import clef_policy_cache
 from sglang.srt.beam_search.output import (
     beam_completion_tokens,
     pack_beam_search_output,
@@ -251,6 +252,7 @@ class SchedulerOutputStreamer:
         retraction_counts = []
         phs_list = []
         has_phs = False
+        clef_traces = [] if clef_policy_cache.enabled(self.server_args) else None
         for req in reqs:
             if req.finished():
                 rids.append(req.rid)
@@ -259,6 +261,14 @@ class SchedulerOutputStreamer:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
+                if clef_traces is not None:
+                    # Streamed after release_kv_cache, so a newly committed checkpoint
+                    # and the prefix restored for this request are distinguishable.
+                    clef_traces.append({
+                        "matched_tokens": getattr(req, "clef_full_kv_match", 0),
+                        "branch_boundary": req.mamba_branching_seqlen or 0,
+                        "published_tokens": getattr(req, "clef_checkpoint_published", 0),
+                    })
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self.get_cached_tokens_details(req))
@@ -307,6 +317,7 @@ class SchedulerOutputStreamer:
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,
                 pooled_hidden_states=stacked_phs,
+                clef_cache_traces=clef_traces,
             )
         )
 

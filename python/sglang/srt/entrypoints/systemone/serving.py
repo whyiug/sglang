@@ -7,16 +7,19 @@ import dataclasses
 import json
 import math
 import string
+import uuid
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 import orjson
 import pybase64
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse
 from PIL import Image
 
+from sglang.srt import clef_policy_cache
 from sglang.srt.entrypoints.openai.serving_decisions import (
     EncodedQuestion,
     OpenAIServingDecisions,
@@ -71,6 +74,20 @@ class SystemOneServing(OpenAIServingDecisions):
     /v1/decisions, or, for a Clef checkpoint, with its joint schema head."""
 
     route = "/v1/systemone"
+
+    def __init__(self, chat_serving):
+        super().__init__(chat_serving)
+        path = Path(self.tokenizer_manager.model_config.model_path) / "unsloth_decision_config.json"
+        self.clef_temperatures = (
+            json.loads(path.read_text()).get("temperature", [1.0] * 3)
+            if self.joint_head_config is not None and path.is_file()
+            else [1.0] * 3
+        )
+        if len(self.clef_temperatures) != 3 or any(
+            not isinstance(t, (int, float)) or not math.isfinite(t) or t <= 0
+            for t in self.clef_temperatures
+        ):
+            raise ValueError("invalid Clef per-type calibration temperatures")
 
     def _request_id_prefix(self) -> str:
         return "systemone-"
@@ -196,6 +213,44 @@ class SystemOneServing(OpenAIServingDecisions):
         ret = await self.tokenizer_manager.generate_request(
             adapted_request, raw_request
         ).__anext__()
+        cache = None
+        if clef_policy_cache.enabled(self.tokenizer_manager.server_args):
+            _check_clef_abort(ret)
+            meta = ret["meta_info"]
+            prompt_tokens = meta["prompt_tokens"]
+            cached = meta["cached_tokens"]
+            if type(cached) is not int or not 0 <= cached < prompt_tokens:
+                raise RuntimeError("Unexpected CLEF scheduler cache accounting")
+            cache = dict(
+                status="hit" if cached else "miss",
+                cached_tokens=cached,
+                engine_cached_tokens=cached,
+                computed_tokens=prompt_tokens-cached,
+                retry_tokens=0,
+                rid=meta["id"],
+                **meta["clef_cache_trace"],
+            )
+            if not ret["embedding"] and cached:
+                # Isolate the recovery request from all existing prefix states.
+                retry = dataclasses.replace(
+                    adapted_request, rid="clef-cache-retry-" + uuid.uuid4().hex
+                )
+                ret = await self.tokenizer_manager.generate_request(
+                    retry, raw_request
+                ).__anext__()
+                _check_clef_abort(ret)
+                if (
+                    ret["meta_info"]["cached_tokens"] != 0
+                    or ret["meta_info"]["prompt_tokens"] != prompt_tokens
+                ):
+                    raise RuntimeError("The CLEF recovery request was not recomputed in full")
+                cache.update(
+                    status="fallback",
+                    cached_tokens=0,
+                    computed_tokens=2 * prompt_tokens - cached,
+                    retry_tokens=prompt_tokens,
+                    retry_rid=ret["meta_info"]["id"],
+                )
         logits = ret["embedding"]
         names = [
             [name for name, _ in joint_schema_options(question)]
@@ -208,6 +263,10 @@ class SystemOneServing(OpenAIServingDecisions):
         for question_id, view, question_names in zip(request.questions, views, names):
             scores = logits[offset : offset + len(question_names)]
             offset += len(question_names)
+            temperature = self.clef_temperatures[
+                {"yes_no": 2, "choice": 0, "score": 1}[view.kind]
+            ]
+            scores = [score / temperature for score in scores]
             top = max(scores)
             weights = [math.exp(score - top) for score in scores]
             total = math.fsum(weights)
@@ -225,17 +284,25 @@ class SystemOneServing(OpenAIServingDecisions):
                 mass=1.0,
                 question_id=question_id,
             )
+            # Preserve the original Unsloth Clef API's confidence semantics.
+            # The generic System One adapter reports a different confidence.
+            if view.kind in ("choice", "score"):
+                answers[question_id].confidence = round(max(by_name.values()), 4)
         response = SystemOneResponse(
             model=self.tokenizer_manager.served_model_name,
             answers=answers,
             usage=SystemOneUsage(input_tokens=ret["meta_info"]["prompt_tokens"]),
         )
         # The head scores only the allowed options, so there is no label mass.
-        return ORJSONResponse(
-            content=response.model_dump(
-                exclude={"answers": {"__all__": {"x_label_mass"}}}
-            )
-        )
+        content = response.model_dump(exclude={"answers": {"__all__": {"x_label_mass"}}})
+        if (
+            cache is not None
+            and raw_request is not None
+            and raw_request.headers.get("X-SGLang-Clef-Cache-Report") == "1"
+        ):
+            content["usage"]["prompt_tokens_details"] = {"cached_tokens": cache["cached_tokens"]}
+            content.setdefault("metadata", {})["clef_prefix_cache"] = cache
+        return ORJSONResponse(content=content)
 
     def _encoded_systemone_questions(
         self, request: SystemOneRequest, views: List[QuestionView]
@@ -373,6 +440,17 @@ class SystemOneServing(OpenAIServingDecisions):
             else {"answers": {"__all__": {"x_label_mass"}}}
         )
         return ORJSONResponse(content=response.model_dump(exclude=exclude))
+
+
+def _check_clef_abort(result: dict) -> None:
+    # Administrative aborts may carry no embedding or token counters. They
+    # terminate the business request and must never trigger a cold retry.
+    reason = result["meta_info"].get("finish_reason") or {}
+    if reason.get("type") == "abort":
+        raise HTTPException(
+            status_code=reason.get("status_code") or 409,
+            detail=reason.get("message") or "CLEF request aborted",
+        )
 
 
 def _view(question: SystemOneQuestion) -> QuestionView:

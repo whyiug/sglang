@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -62,6 +63,14 @@ SUPPORTED_UNARY_ACTIVATIONS = {"relu2"}
 def _run_activation_inplace(
     op_name: str, input: torch.Tensor, out: torch.Tensor
 ) -> None:
+    # Opt-in compatibility path for deployments where the TVM-FFI JIT launch
+    # fails with cudaErrorInvalidResourceHandle. The bundled kernel implements
+    # the same dense SiLU-and-multiply operation; filtered/MoE paths stay intact.
+    if op_name == "silu" and os.environ.get("SGLANG_PRECOMPILED_SILU") == "1":
+        from sgl_kernel import silu_and_mul as precompiled_silu_and_mul
+
+        precompiled_silu_and_mul(input, out)
+        return
     hidden_size = input.shape[-1] // 2
     module = activation_module(input.dtype)
     input_2d = input.view(-1, hidden_size * 2)

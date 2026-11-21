@@ -478,6 +478,10 @@ class SchedulerBatchResultProcessor:
                     continue
 
                 req.embedding = embeddings[i]
+                if hasattr(req, "clef_full_kv_match") and not req.embedding:
+                    # An invalid hidden slot suppresses this request's scores.
+                    # Its privately computed suffix must not seed a new branch.
+                    req.skip_radix_cache_insert = True
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
                 if req.inflight_middle_chunks <= 0:

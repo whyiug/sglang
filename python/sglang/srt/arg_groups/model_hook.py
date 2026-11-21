@@ -34,6 +34,7 @@ from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 from sglang.srt.connector import ConnectorType
+from sglang.srt import clef_policy_cache
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -144,6 +145,9 @@ def handle_model_specific_adjustments(server_args: Any):
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
     )
+
+    if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
+        clef_policy_cache.resolve(server_args, model_config_of(server_args))
 
     if cfg.enable_deterministic_inference:
         declare_resolution(
@@ -985,9 +989,10 @@ def handle_model_capability_adjustments(server_args: Any):
                 "Clef checkpoints are served with --tp-size 1 and --pp-size 1, "
                 "since the joint schema head reads full LM head rows"
             )
+        cache_enabled = clef_policy_cache.enabled(server_args)
         for key, value in (
             ("is_embedding", True),
-            ("disable_radix_cache", True),
+            ("disable_radix_cache", not cache_enabled),
             ("chunked_prefill_size", -1),
         ):
             declare_resolution(
@@ -1003,7 +1008,11 @@ def handle_model_capability_adjustments(server_args: Any):
             )
         logger.info(
             "Clef joint schema head detected: serving /v1/systemone decisions in "
-            "embedding mode without radix cache, chunked prefill, or CUDA graphs."
+            "embedding mode, automatic prefix cache=%s, attention=%s, "
+            "deterministic=%s, checkpoint=%s, KV page=%s, tree=%s",
+            cache_enabled, cfg.attention_backend, cfg.enable_deterministic_inference,
+            cfg.mamba_radix_cache_strategy, cfg.page_size,
+            "device-local Python + FP32 snapshot" if cache_enabled else "disabled"
         )
 
     if (

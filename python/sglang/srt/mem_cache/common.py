@@ -11,6 +11,7 @@ from sglang.kernels.ops.memory.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
 )
 from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
+from sglang.srt import clef_policy_cache
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -212,6 +213,23 @@ def match_kv_cache(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
+    auto_cache = clef_policy_cache.enabled()
+    if auto_cache and (
+        req.skip_radix_cache_insert
+        or req.decision_layout is None
+        or req.multimodal_inputs is not None
+        or req.input_embeds is not None
+        or req.positional_embed_overrides is not None
+        or req.lora_id is not None
+        or req.session_id is not None
+        or req.rid.startswith("clef-cache-retry-")
+    ):
+        # Recovery and requests outside the validated text path must neither
+        # consume nor publish reusable state. Eligible requests retain the
+        # normal engine limit and the RadixKey's existing namespace and salt.
+        max_prefix_len = 0
+        req.skip_radix_cache_insert = True
+
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
@@ -224,6 +242,11 @@ def match_kv_cache(
             tree_cache, match_result, extra_key=req.extra_key
         )
     req.prefix_len = match_result.device_prefix_len
+    if auto_cache and cow_mamba:
+        # Only the admission match has a state snapshot. A waiting-queue
+        # priority lookup may have observed a different tree.
+        req.clef_full_kv_match = match_result.full_kv_hit_length
+        req.clef_checkpoint_published = 0
     (
         req.last_node,
         req.last_host_node,

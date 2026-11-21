@@ -1211,6 +1211,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # Update req fields
         req.kv.cache_protected_len = len(new_indices)
         req.last_node = new_last_node
+        if (
+            hasattr(req, "clef_checkpoint_published")
+            and insert_params.mamba_value is not None
+            and not result.mamba_exist
+        ):
+            # Report a newly donated state only after the insert and
+            # component-consensus re-match. A concurrent insert may have won.
+            req.clef_checkpoint_published = len(new_indices)
 
         # cleanup
         for comp in self._components_tuple:

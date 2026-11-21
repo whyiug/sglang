@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt import clef_policy_cache
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
@@ -123,6 +124,8 @@ def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
 
 def select_tree_core_backend(params: CacheInitParams) -> str:
     """Resolve the instance override or default through the shared fallback policy."""
+    if params.tree_core_backend is None and clef_policy_cache.enabled():
+        return "python"
     name = (
         params.tree_core_backend
         if params.tree_core_backend is not None

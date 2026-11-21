@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt import clef_policy_cache
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
@@ -322,6 +323,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
+
+        if clef_policy_cache.enabled() and kvc.model_config.joint_head_config is not None:
+            # One final BF16 backbone row and its original int64 ID per KV slot.
+            bytes_per_slot = 2 * kvc.model_config.hidden_size + 8
+            self._cell_size += bytes_per_slot
+            self._fixed_overhead_bytes += bytes_per_slot * kvc.page_size
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""

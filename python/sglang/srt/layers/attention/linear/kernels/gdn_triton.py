@@ -1,9 +1,10 @@
 import torch
 
+from sglang.srt import clef_policy_cache
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
@@ -166,6 +167,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
             softplus_threshold=20.0,
         )
 
+    # Save the CLEF checkpoint from the FP32 recurrence registers, before h is rounded.
+    @property
+    def supports_track_state_snapshot(self):
+        return is_cuda() and clef_policy_cache.enabled()
+
     def extend(
         self,
         q: torch.Tensor,
@@ -178,6 +184,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         inplace_update: bool = True,
+        track_state: torch.Tensor | None = None,
+        track_chunk_idx: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple:
         recurrent_state = ssm_states
@@ -199,6 +207,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # The external NPU kernel does not expose the optional write-back
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
+
+        if track_state is not None:
+            if not self.supports_track_state_snapshot:
+                raise RuntimeError("Exact GDN intermediate checkpoints require the CUDA CLEF policy cache")
+            inplace_update_args.update(track_state=track_state, track_chunk_idx=track_chunk_idx)
 
         return chunk_gated_delta_rule(
             q=q,

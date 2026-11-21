@@ -277,6 +277,8 @@ def _handle_output_by_index(output, i):
             rids=[output.rids[i]],
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             embeddings=_extract_field_by_index(output, "embeddings", i),
+            clef_cache_traces=_extract_field_by_index(output, "clef_cache_traces", i),
+            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             placeholder_tokens_idx=None,

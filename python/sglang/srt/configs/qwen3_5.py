@@ -18,6 +18,7 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
 
     def __init__(
         self,
+        layer_types=None,
         **kwargs,
     ):
         # HF Qwen3.5 checkpoints may provide RoPE settings under rope_parameters.
@@ -27,6 +28,9 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
             kwargs["rope_scaling"] = rope_parameters
 
         super().__init__(**kwargs)
+        # Qwen3NextConfig builds the runtime block schedule from full_attention_interval.
+        # Retain an explicit checkpoint schedule for consumers that verify their agreement.
+        self.layer_types = layer_types
         if self.rope_scaling is None:
             self.rope_scaling = rope_parameters or {}
 

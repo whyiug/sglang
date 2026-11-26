@@ -22,12 +22,34 @@ def unsupported_reason(cfg, model, *, cuda, explicit_tree_backend):
     if cfg.disable_radix_cache:
         return "radix cache explicitly disabled"
     text = model.hf_text_config
-    if (model.hf_config.architectures[0] != "Qwen3_5ForConditionalGeneration"
-            or getattr(text, "model_type", None) != "qwen3_5_text"
-            or (text.hidden_size, text.num_hidden_layers) != (2560, 32)
-            or set(getattr(text, "layers_block_type", ())) != {"attention", "linear_attention"}
-            or getattr(text, "is_causal", True) is False):
-        return "outside the causal Qwen3.5-4B joint-head profile"
+    if (
+        model.hf_config.architectures != ["Qwen3_5ForConditionalGeneration"]
+        or getattr(text, "model_type", None) != "qwen3_5_text"
+        or not getattr(text, "is_causal", True)
+    ):
+        return "requires a dense causal Qwen3.5 joint-head backbone"
+    # The model and the KV/recurrent pools both use layers_block_type. If the
+    # checkpoint also declares an explicit schedule, both must describe the same layers.
+    if not getattr(text, "full_attention_interval", 0):
+        return "requires a hybrid Qwen3.5 attention schedule"
+    blocks = text.layers_block_type
+    if len(blocks) != text.num_hidden_layers or set(blocks) != {"attention", "linear_attention"}:
+        return "requires both full and linear attention layers"
+    if text.layer_types is not None and [
+        "attention" if layer == "full_attention" else layer for layer in text.layer_types
+    ] != blocks:
+        return "checkpoint attention schedule differs from the loaded Qwen3.5 backbone"
+    # The Triton GDN state kernel tiles up to 256 key features and assigns each
+    # group of value heads to one key head. CUDA causal Conv1D supports widths 2–4.
+    if (
+        not 0 < text.linear_key_head_dim <= 256
+        or text.linear_value_head_dim <= 0
+        or text.linear_num_key_heads <= 0
+        or text.linear_num_value_heads <= 0
+        or text.linear_num_value_heads % text.linear_num_key_heads
+        or not 2 <= text.linear_conv_kernel_dim <= 4
+    ):
+        return "unsupported Triton GDN or causal Conv1D checkpoint geometry"
     if not cuda or str(cfg.device).split(":")[0] != "cuda":
         return "requires NVIDIA CUDA"
     if (cfg.tp_size, cfg.pp_size, cfg.dp_size, cfg.dcp_size) != (1, 1, 1, 1):

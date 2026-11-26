@@ -32,7 +32,9 @@ CLEF 联合分类头需要看到完整序列的最终隐藏状态。每个驻留
 
 ## 支持的执行配置
 
-本分支自动启用的范围是单张 NVIDIA GPU、固定权重、未量化 BF16、FP32 递推状态的因果 Qwen3.5-4B CLEF 联合头。能力检测会核对模型结构，包括隐藏维度 2560、32 层以及混合注意力类型。运行时采用确定性 Triton、设备本地 Python Radix 树、`extra_buffer` 检查点和单 token KV 页。这些数值和后端选项描述执行配置，输入前缀的长度由每对请求决定。[能力判定](../../python/sglang/srt/clef_policy_cache.py) · [模型配置](../../python/sglang/srt/arg_groups/model_hook.py)
+引擎在加载到 CLEF 联合头配置后检查稠密因果 Qwen3.5 骨干的实际结构，包括全注意力与线性注意力的层序、线性注意力的头数和头维度、卷积核宽度。Qwen3.5 的 0.8B、2B 和 4B 配置使用同一套判定。隐藏向量按模型宽度保存，分支检查点按该模型的递推状态形状保存。普通生成式检查点沿用 SGLang 原有推理路径。[能力判定](../../python/sglang/srt/clef_policy_cache.py) · [隐藏向量存储](../../python/sglang/srt/layers/clef_hidden_slots.py)
+
+自动缓存要求 SGLang 原生模型实现、单张 NVIDIA GPU、固定权重、未量化 BF16、BF16 卷积状态和 FP32 递推状态。运行时采用确定性 Triton、设备本地 Python Radix 树、`extra_buffer` 检查点和单 token KV 页。新检查点可用下文的配对验收核实实际缓存命中和输出。[模型配置](../../python/sglang/srt/arg_groups/model_hook.py)
 
 显式设置 `--disable-radix-cache` 可选择全量计算。LoRA、多卡、不兼容的注意力后端和外部缓存等设置均在这条优化路径的适用范围之外。单笔请求带有多模态输入、自定义输入嵌入或位置覆盖时，会跳过前缀读写。更换权重、tokenizer、模板或校准版本时应启动新实例。[请求级检查](../../python/sglang/srt/mem_cache/common.py) · [权重更新](../../python/sglang/srt/managers/scheduler_components/weight_updater.py)
 
@@ -45,4 +47,4 @@ git diff --stat 75a0d91c1f36a03e5213123fcdc4dbf0028ab7b7 HEAD -- python/sglang
 git diff 75a0d91c1f36a03e5213123fcdc4dbf0028ab7b7 HEAD -- python/sglang
 ```
 
-可以在同一分支用 `--disable-radix-cache --enable-deterministic-inference --attention-backend triton` 启动全量计算对照端。使用相同模型、tokenizer 和输入，先比较每个问题的完整公开答案与计数，再独立比较经过预热的端到端时延和吞吐。若要将支持范围扩大到其他模型或执行配置，还需覆盖改变问题和前缀、检查点淘汰及失效重试。[部署与配对验收](README.zh-CN.md)
+可以在同一分支用 `--disable-radix-cache --enable-deterministic-inference --attention-backend triton --linear-attn-prefill-backend triton` 启动全量计算对照端。使用相同模型、tokenizer 和输入，确认自动缓存端有请求实际恢复了前缀，逐题核对完整公开答案，再独立比较经过预热的端到端时延和吞吐。若要将支持范围扩大到其他模型或执行配置，还需覆盖改变问题和前缀、检查点淘汰及失效重试。[部署与配对验收](README.zh-CN.md)

@@ -1,6 +1,6 @@
 # 部署 CLEF 自动前缀缓存版 SGLang
 
-本分支面向单张 NVIDIA GPU 上的 BF16 Qwen3.5-4B CLEF 联合分类模型。每次调用 `POST /v1/systemone` 时，`state` 传入待分析文本，`questions` 传入一个或多个问题，问题 ID 由调用方命名。
+基于 Qwen3.5 稠密骨干的 0.8B、2B 和 4B CLEF 联合分类模型共用一个镜像和启动命令。把 `CLEF_MODEL` 指向相应的完整 CLEF 检查点，服务在单张 NVIDIA GPU 上读取模型配置，为满足条件的 BF16 模型自动启用前缀缓存。每次调用 `POST /v1/systemone` 时，`state` 传入待分析文本，`questions` 传入一个或多个问题。
 
 如果几次请求的文本以相同的固定指令开头，服务会按模板渲染、分词后的 token 序列从头匹配，在已驻留且可恢复的检查点继续计算。普通文本的共同开头也能复用。调用方无需标注前缀、设置长度或约定分隔符。每次请求都可以更换文本、问题或两者。更换权重、tokenizer 或模板时启动新实例。[工作原理与模型适用范围](DESIGN.zh-CN.md)
 
@@ -76,7 +76,7 @@ PY
 
 `matched_tokens` 是匹配到的长度，`cached_tokens` 是本次实际恢复的长度，`computed_tokens` 是本次实际计算量。若第二个请求才建立分叉检查点，后续请求可从该点恢复。输出为 `None` 时，可查看启动日志中记录的模型和运行配置是否启用了自动缓存。[缓存诊断与适用范围](DESIGN.zh-CN.md)
 
-要核对自己的输入在启用缓存前后的输出，可以分两次启动同一个镜像。全量计算实例在启动命令末尾追加 `--disable-radix-cache --enable-deterministic-inference --attention-backend triton`。另一次使用上面的自动缓存启动命令。向两端回放相同的请求，按问题 ID 比较完整的 `answers` 字段。
+更换检查点后，可分两次启动同一镜像验收。全量计算实例在启动命令末尾追加 `--disable-radix-cache --enable-deterministic-inference --attention-backend triton --linear-attn-prefill-backend triton`，自动缓存实例使用上面的启动命令。向两端回放同一批共享前缀、后缀不同的请求，按问题 ID 逐项核对完整的 `answers` 字段，同时确认自动缓存实例有请求返回 `cached_tokens > 0`。这样能实际覆盖从前缀检查点恢复的计算路径。
 
 ## 4. 查看与维护改动
 

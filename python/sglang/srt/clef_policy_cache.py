@@ -19,8 +19,14 @@ def enabled(server_args=None):
 
 
 def unsupported_reason(cfg, model, *, cuda, explicit_tree_backend):
+    import torch
+
+    from sglang.srt.configs.mamba_utils import mamba2_state_dtype
+
     if cfg.disable_radix_cache:
         return "radix cache explicitly disabled"
+    if cfg.model_impl not in ("auto", "sglang"):
+        return "requires SGLang's native Qwen3.5 joint-head implementation"
     text = model.hf_text_config
     if (
         model.hf_config.architectures != ["Qwen3_5ForConditionalGeneration"]
@@ -54,10 +60,24 @@ def unsupported_reason(cfg, model, *, cuda, explicit_tree_backend):
         return "requires NVIDIA CUDA"
     if (cfg.tp_size, cfg.pp_size, cfg.dp_size, cfg.dcp_size) != (1, 1, 1, 1):
         return "requires a single local GPU"
-    if (str(model.dtype) != "torch.bfloat16" or cfg.quantization or model.quantization
-            or cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16")
-            or (cfg.mamba_ssm_dtype or getattr(text, "mamba_ssm_dtype", None)) != "float32"):
-        return "requires unquantized BF16 with FP32 recurrent state"
+    state_dtype = mamba2_state_dtype(text)
+    # The serving hook writes an explicit CLI SSM dtype to the worker environment
+    # after capability resolution. Otherwise the pool uses the native resolver above.
+    use_fp32_ssm = (
+        cfg.mamba_ssm_dtype == "float32"
+        if cfg.mamba_ssm_dtype is not None
+        else state_dtype.temporal == torch.float32
+    )
+    if (
+        model.dtype != torch.bfloat16
+        or cfg.quantization
+        or model.quantization
+        or cfg.kv_cache_dtype not in ("auto", "bf16", "bfloat16")
+        # GDN publishes the BF16 projected activations by indexed assignment to the conv pool.
+        or state_dtype.conv != torch.bfloat16
+        or not use_fp32_ssm
+    ):
+        return "requires unquantized BF16, BF16 Conv1D state and FP32 recurrent state"
     for name in ("attention_backend", "prefill_attention_backend", "decode_attention_backend",
                  "mamba_backend", "linear_attn_backend", "linear_attn_prefill_backend",
                  "linear_attn_decode_backend"):
